@@ -274,6 +274,7 @@ for sub in "${SUBSCRIPTIONS[@]}"; do
     compliance_tuples=$(jq --arg sub "${sub}" '[.[] | {
         assignmentName: (.policyAssignmentName // .PolicyAssignmentName // null),
         definitionName: (.policyDefinitionName // .PolicyDefinitionName // null),
+        definitionId: (.policyDefinitionId // .PolicyDefinitionId // null),
         scope: (.policyAssignmentScope // .PolicyAssignmentScope // null),
         effect: (.policyDefinitionAction // .PolicyDefinitionAction // null),
         subscriptionId: $sub
@@ -293,6 +294,164 @@ RELEVANT_DENY_MODIFY_JSON=$(jq -c '[.[] | select(
     or ((.definitionName // "") | test("PublicNetwork|LocalAuth|SKU|Limit|Capacity"; "i"))
   )]' <<<"${EFFECTIVE_COMPLIANCE_JSON}")
 
+# ---------------------------------------------------------------------------
+# 3a. Policy definition + assignment detail expansion for the Deny/Modify shortlist
+# ---------------------------------------------------------------------------
+
+# Attach assignment detail (from the already-collected ASSIGNMENTS_VISIBLE_JSON) to each
+# shortlist entry, keyed by assignmentName. Assignments inherited from an inaccessible
+# management-group scope won't be in ASSIGNMENTS_VISIBLE_JSON, so assignmentDetail is null there.
+RELEVANT_DENY_MODIFY_JSON=$(jq -c --argjson assignments "${ASSIGNMENTS_VISIBLE_JSON}" '
+  ($assignments | INDEX(.name)) as $byName
+  | [.[] | . + {assignmentDetail: (
+      $byName[.assignmentName // ""] as $a
+      | if $a == null then null else {
+          name: $a.name, displayName: $a.displayName, scope: $a.scope,
+          policyDefinitionId: $a.policyDefinitionId, parameters: ($a.parameters // {}),
+          enforcementMode: $a.enforcementMode, notScopes: ($a.notScopes // []),
+          nonComplianceMessages: ($a.nonComplianceMessages // []), identity: $a.identity
+        } end
+    )}]
+' <<<"${RELEVANT_DENY_MODIFY_JSON}")
+
+# Resolve the full policy definition (via `az policy definition show`) for every distinct
+# definition name in the shortlist, plus a simplified best-effort constraint summary derived
+# from its policyRule. Best-effort/independent per definition: an unresolvable definition is
+# reported as {name, error} rather than aborting discovery.
+DEFINITIONS_TO_RESOLVE_JSON=$(jq -c '
+  [ .[] | select(.definitionName != null) ]
+  | group_by(.definitionName)
+  | map({
+      definitionName: .[0].definitionName,
+      definitionId: (.[0].definitionId // null),
+      subscriptionId: (.[0].subscriptionId // null),
+      effect: (.[0].effect // null)
+    })
+' <<<"${RELEVANT_DENY_MODIFY_JSON}")
+
+definitions_detail_files=()
+didx=0
+while IFS= read -r entry; do
+  didx=$((didx + 1))
+  def_name=$(jq -r '.definitionName' <<<"${entry}")
+  def_id=$(jq -r '.definitionId // empty' <<<"${entry}")
+  def_sub=$(jq -r '.subscriptionId // empty' <<<"${entry}")
+  def_effect=$(jq -r '.effect // empty' <<<"${entry}")
+
+  # Derive the correct scope flag from the compliance record's definitionId when available (it
+  # encodes whether the definition lives under a management group, a subscription, or is a
+  # tenant-wide built-in) - this avoids guessing at scope.
+  scope_args=()
+  if [[ -n "${def_id}" ]]; then
+    def_id_lc="${def_id,,}"
+    if [[ "${def_id_lc}" == *"/managementgroups/"* ]]; then
+      mg_id=$(sed -E 's#.*/managementgroups/([^/]+)/.*#\1#' <<<"${def_id_lc}")
+      scope_args=(--management-group "${mg_id}")
+    elif [[ "${def_id_lc}" == *"/subscriptions/"* ]]; then
+      sub_id=$(sed -E 's#.*/subscriptions/([^/]+)/.*#\1#' <<<"${def_id_lc}")
+      scope_args=(--subscription "${sub_id}")
+    fi
+  fi
+
+  definition_raw=""
+  if [[ ${#scope_args[@]} -gt 0 ]]; then
+    definition_raw=$(run_az_json "policy definition show for '${def_name}'" \
+      az policy definition show --name "${def_name}" "${scope_args[@]}" -o json) || true
+  fi
+  if [[ -z "${definition_raw}" ]]; then
+    definition_raw=$(run_az_json "policy definition show for '${def_name}' (bare name)" \
+      az policy definition show --name "${def_name}" -o json) || true
+  fi
+  if [[ -z "${definition_raw}" && -n "${def_sub}" ]]; then
+    definition_raw=$(run_az_json "policy definition show for '${def_name}' (subscription fallback)" \
+      az policy definition show --name "${def_name}" --subscription "${def_sub}" -o json) || true
+  fi
+  if [[ -z "${definition_raw}" && -n "${MANAGEMENT_GROUP}" ]]; then
+    definition_raw=$(run_az_json "policy definition show for '${def_name}' (management-group fallback)" \
+      az policy definition show --name "${def_name}" --management-group "${MANAGEMENT_GROUP}" -o json) || true
+  fi
+
+  if [[ -n "${definition_raw}" ]]; then
+    detail=$(jq -c --arg name "${def_name}" --arg effect "${def_effect}" '
+      def contains_rg_segment($v):
+        if ($v | type) == "string" then ($v | ascii_downcase | test("/resourcegroups/"))
+        elif ($v | type) == "array" then any($v[]; (type == "string") and (. | ascii_downcase | test("/resourcegroups/")))
+        else false end;
+      def bucket_of($f; $v):
+        ($f | ascii_downcase) as $fl
+        | if $fl == "type" then "resourceTypesAffected"
+          elif $fl == "name" then "namingRules"
+          elif ($fl == "resourcegroup" or $fl == "resourcegroup.name" or $fl == "resourcegroupname") then "resourceGroupRules"
+          elif ($fl == "id" or $fl == "fullname") and contains_rg_segment($v) then "resourceGroupRules"
+          elif $fl == "location" then "locationRules"
+          elif ($fl | startswith("tags")) then "tagRules"
+          elif (($fl | startswith("microsoft.network/")) or ($fl | test("subnet|vnet|virtualnetwork|networksecuritygroup|publicip"))) then "networkRules"
+          else null
+          end;
+      def field_conditions:
+        if type == "object" then
+          (if has("field") then
+             ([keys[] | select(. != "field")] | first) as $opKey
+             | [{field: .field, operator: $opKey, value: (if $opKey == null then null else .[$opKey] end)}]
+           else [] end)
+          + ([.[]? | field_conditions] | add // [])
+        elif type == "array" then
+          ([.[] | field_conditions] | add // [])
+        else [] end;
+      . as $def
+      | ($def.policyRule.if // {} | field_conditions) as $conds
+      | ($conds | map(select(bucket_of(.field; .value) == "resourceTypesAffected") | .value) | select(. != null) | flatten) as $typesRaw
+      | ($typesRaw // [] | unique) as $types
+      | ($conds | map(select(bucket_of(.field; .value) == "namingRules"))) as $naming
+      | ($conds | map(select(bucket_of(.field; .value) == "resourceGroupRules"))) as $rgRules
+      | ($conds | map(select(bucket_of(.field; .value) == "locationRules"))) as $locRules
+      | ($conds | map(select(bucket_of(.field; .value) == "networkRules"))) as $netRules
+      | ($conds | map(select(bucket_of(.field; .value) == "tagRules"))) as $tagRules
+      | {
+          definition: {
+            name: ($def.name // $name),
+            id: ($def.id // null),
+            displayName: ($def.displayName // null),
+            description: ($def.description // null),
+            policyType: ($def.policyType // null),
+            mode: ($def.mode // null),
+            version: ($def.version // ($def.metadata.version) // null),
+            metadata: ($def.metadata // {}),
+            parameters: ($def.parameters // {}),
+            policyRule: ($def.policyRule // {}),
+            roleDefinitionIds: ($def.policyRule.then.details.roleDefinitionIds // [])
+          },
+          summary: {
+            definitionName: ($def.name // $name),
+            displayName: ($def.displayName // null),
+            effect: (if $effect == "" then null else $effect end),
+            resourceTypesAffected: $types,
+            namingRules: $naming,
+            resourceGroupRules: $rgRules,
+            locationRules: $locRules,
+            networkRules: $netRules,
+            tagRules: $tagRules
+          }
+        }
+    ' <<<"${definition_raw}")
+  else
+    log_warn "Unable to resolve policy definition '${def_name}'; reporting as unresolved."
+    detail=$(jq -c -n --arg name "${def_name}" '{definition: {name: $name, error: "unresolved"}, summary: null}')
+  fi
+
+  printf '%s' "${detail}" > "${SCRATCH_DIR}/def_${didx}.json"
+  definitions_detail_files+=("${SCRATCH_DIR}/def_${didx}.json")
+done < <(jq -c '.[]' <<<"${DEFINITIONS_TO_RESOLVE_JSON}")
+
+if [[ ${#definitions_detail_files[@]} -gt 0 ]]; then
+  DEFINITIONS_DETAIL_COMBINED_JSON=$(jq -s '.' "${definitions_detail_files[@]}")
+else
+  DEFINITIONS_DETAIL_COMBINED_JSON="[]"
+fi
+
+POLICY_DEFINITIONS_DETAIL_JSON=$(jq -c '[.[].definition]' <<<"${DEFINITIONS_DETAIL_COMBINED_JSON}")
+POLICY_DEFINITIONS_SIMPLIFIED_JSON=$(jq -c '[.[].summary | select(. != null)]' <<<"${DEFINITIONS_DETAIL_COMBINED_JSON}")
+
 MG_ASSIGNMENTS_JSON="[]"
 if [[ -n "${MANAGEMENT_GROUP}" ]]; then
   if mg_raw=$(run_az_json "policy assignment listing for management group ${MANAGEMENT_GROUP}" \
@@ -309,10 +468,14 @@ POLICY_JSON=$(jq -n \
   --argjson effectiveFromComplianceState "${EFFECTIVE_COMPLIANCE_JSON}" \
   --argjson relevantDenyOrModify "${RELEVANT_DENY_MODIFY_JSON}" \
   --argjson managementGroupAssignments "${MG_ASSIGNMENTS_JSON}" \
+  --argjson definitionsDetail "${POLICY_DEFINITIONS_DETAIL_JSON}" \
+  --argjson definitionsSimplified "${POLICY_DEFINITIONS_SIMPLIFIED_JSON}" \
   '{assignmentsVisible: $assignmentsVisible,
     effectiveFromComplianceState: $effectiveFromComplianceState,
     relevantDenyOrModify: $relevantDenyOrModify,
-    managementGroupAssignments: $managementGroupAssignments}')
+    managementGroupAssignments: $managementGroupAssignments,
+    definitionsDetail: $definitionsDetail,
+    definitionsSimplified: $definitionsSimplified}')
 
 # ---------------------------------------------------------------------------
 # 4. Observed naming conventions (best-effort, not authoritative)

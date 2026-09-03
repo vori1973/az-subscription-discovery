@@ -247,11 +247,13 @@ foreach ($sub in $Subscription) {
     foreach ($state in (ConvertTo-ArrayOrEmpty $complianceRaw)) {
         $assignmentName = if ($state.policyAssignmentName) { $state.policyAssignmentName } else { $state.PolicyAssignmentName }
         $definitionName = if ($state.policyDefinitionName) { $state.policyDefinitionName } else { $state.PolicyDefinitionName }
+        $definitionId = if ($state.policyDefinitionId) { $state.policyDefinitionId } else { $state.PolicyDefinitionId }
         $scope = if ($state.policyAssignmentScope) { $state.policyAssignmentScope } else { $state.PolicyAssignmentScope }
         $effect = if ($state.policyDefinitionAction) { $state.policyDefinitionAction } else { $state.PolicyDefinitionAction }
         $ComplianceTuplesAll.Add([ordered]@{
             assignmentName = $assignmentName
             definitionName = $definitionName
+            definitionId   = $definitionId
             scope          = $scope
             effect         = $effect
             subscriptionId = $sub
@@ -259,13 +261,13 @@ foreach ($sub in $Subscription) {
     }
 }
 
-# Dedupe distinct (assignmentName, definitionName, scope, effect, subscriptionId) tuples.
-# (Sort-Object -Unique is unreliable for ordered-hashtable equality, so dedupe explicitly via a
-# composite string key instead.)
+# Dedupe distinct (assignmentName, definitionName, definitionId, scope, effect, subscriptionId)
+# tuples. (Sort-Object -Unique is unreliable for ordered-hashtable equality, so dedupe explicitly
+# via a composite string key instead.)
 $seenTuples = [System.Collections.Generic.HashSet[string]]::new()
 $EffectiveCompliance = [System.Collections.Generic.List[object]]::new()
 foreach ($tuple in $ComplianceTuplesAll) {
-    $key = "$($tuple.assignmentName)|$($tuple.definitionName)|$($tuple.scope)|$($tuple.effect)|$($tuple.subscriptionId)"
+    $key = "$($tuple.assignmentName)|$($tuple.definitionName)|$($tuple.definitionId)|$($tuple.scope)|$($tuple.effect)|$($tuple.subscriptionId)"
     if ($seenTuples.Add($key)) {
         $EffectiveCompliance.Add($tuple)
     }
@@ -298,11 +300,253 @@ if ($ManagementGroup) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# 3a. Policy definition + assignment detail expansion for the Deny/Modify shortlist
+# ---------------------------------------------------------------------------
+
+# Attach assignment detail (when the assignment is visible via 'policy assignment list') to each
+# shortlisted Deny/Modify/naming-pattern entry. Copies are built explicitly rather than mutating
+# $EffectiveCompliance entries in place, since those hashtable objects are shared references and
+# mutating them would leak 'assignmentDetail' into effectiveFromComplianceState too.
+$AssignmentsByName = @{}
+foreach ($a in $AssignmentsVisible) {
+    $an = [string]$a.name
+    if ($an -and -not $AssignmentsByName.ContainsKey($an)) {
+        $AssignmentsByName[$an] = $a
+    }
+}
+
+$RelevantDenyOrModifyWithDetail = [System.Collections.Generic.List[object]]::new()
+foreach ($entry in $RelevantDenyOrModify) {
+    $assignmentDetail = $null
+    $an = [string]$entry.assignmentName
+    if ($an -and $AssignmentsByName.ContainsKey($an)) {
+        $a = $AssignmentsByName[$an]
+        $assignmentDetail = [ordered]@{
+            name                  = $a.name
+            displayName           = $a.displayName
+            scope                 = $a.scope
+            policyDefinitionId    = $a.policyDefinitionId
+            parameters            = if ($a.parameters) { $a.parameters } else { [ordered]@{} }
+            enforcementMode       = $a.enforcementMode
+            notScopes             = if ($a.notScopes) { @($a.notScopes) } else { @() }
+            nonComplianceMessages = if ($a.nonComplianceMessages) { @($a.nonComplianceMessages) } else { @() }
+            identity              = $a.identity
+        }
+    }
+    $withDetail = [ordered]@{}
+    foreach ($key in $entry.Keys) { $withDetail[$key] = $entry[$key] }
+    $withDetail['assignmentDetail'] = $assignmentDetail
+    $RelevantDenyOrModifyWithDetail.Add($withDetail)
+}
+$RelevantDenyOrModify = @($RelevantDenyOrModifyWithDetail)
+
+# Derives the '--management-group <id>' or '--subscription <id>' scope arguments for
+# 'az policy definition show' from a compliance record's policyDefinitionId path, which reliably
+# encodes the scope the definition actually lives at (management group, subscription, or a bare
+# tenant-wide built-in with no scope segment at all).
+function Get-PolicyDefinitionScopeArgs {
+    param([string] $DefinitionId)
+    if (-not $DefinitionId) { return , (@()) }
+    $lc = $DefinitionId.ToLowerInvariant()
+    if ($lc -match '/managementgroups/([^/]+)') {
+        return , (@('--management-group', $Matches[1]))
+    }
+    elseif ($lc -match '/subscriptions/([^/]+)') {
+        return , (@('--subscription', $Matches[1]))
+    }
+    return , (@())
+}
+
+# Recursively walks a deserialized policyRule.if object graph, collecting every {field, operator,
+# value} condition found (operator is whichever sibling key accompanies 'field', e.g. 'equals',
+# 'like', 'match', 'notIn', 'exists' - this generalizes across all Azure Policy comparison
+# operators without enumerating them individually).
+function Get-PolicyRuleFieldConditions {
+    param($Node)
+    $results = [System.Collections.Generic.List[object]]::new()
+    if ($null -eq $Node) { return , (@($results)) }
+    if ($Node -is [array]) {
+        foreach ($item in $Node) {
+            foreach ($r in (Get-PolicyRuleFieldConditions -Node $item)) { $results.Add($r) }
+        }
+        return , (@($results))
+    }
+    if ($Node -is [System.Management.Automation.PSCustomObject]) {
+        $props = @($Node.PSObject.Properties)
+        $fieldProp = $props | Where-Object { $_.Name -eq 'field' } | Select-Object -First 1
+        if ($fieldProp) {
+            $opProp = $props | Where-Object { $_.Name -ne 'field' } | Select-Object -First 1
+            $results.Add([ordered]@{
+                field    = $fieldProp.Value
+                operator = if ($opProp) { $opProp.Name } else { $null }
+                value    = if ($opProp) { $opProp.Value } else { $null }
+            })
+        }
+        foreach ($prop in $props) {
+            foreach ($r in (Get-PolicyRuleFieldConditions -Node $prop.Value)) { $results.Add($r) }
+        }
+        return , (@($results))
+    }
+    return , (@($results))
+}
+
+# True when a field's value (string or array of strings) contains a '/resourceGroups/' path
+# segment - real Azure Policy has no literal 'resourceGroup' field alias, so resource-group
+# constraints are expressed via the 'id'/'fullName' field with a like/match pattern instead.
+function Test-ContainsResourceGroupSegment {
+    param($Value)
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [array]) {
+        foreach ($v in $Value) {
+            if ($v -is [string] -and $v.ToLowerInvariant().Contains('/resourcegroups/')) { return $true }
+        }
+        return $false
+    }
+    if ($Value -is [string]) { return $Value.ToLowerInvariant().Contains('/resourcegroups/') }
+    return $false
+}
+
+function Get-PolicyRuleFieldBucket {
+    param([string] $Field, $Value)
+    $fl = if ($Field) { $Field.ToLowerInvariant() } else { '' }
+    if ($fl -eq 'type') { return 'resourceTypesAffected' }
+    if ($fl -eq 'name') { return 'namingRules' }
+    if ($fl -eq 'resourcegroup' -or $fl -eq 'resourcegroup.name' -or $fl -eq 'resourcegroupname') { return 'resourceGroupRules' }
+    if (($fl -eq 'id' -or $fl -eq 'fullname') -and (Test-ContainsResourceGroupSegment -Value $Value)) { return 'resourceGroupRules' }
+    if ($fl -eq 'location') { return 'locationRules' }
+    if ($fl.StartsWith('tags')) { return 'tagRules' }
+    if ($fl.StartsWith('microsoft.network/') -or ($fl -match 'subnet|vnet|virtualnetwork|networksecuritygroup|publicip')) { return 'networkRules' }
+    return $null
+}
+
+function ConvertTo-PolicyDefinitionDetail {
+    param($RawDefinition, [string] $FallbackName)
+    $roleDefinitionIds = [string[]]@()
+    if ($RawDefinition.policyRule -and $RawDefinition.policyRule.then -and $RawDefinition.policyRule.then.details -and $RawDefinition.policyRule.then.details.roleDefinitionIds) {
+        $roleDefinitionIds = [string[]]@($RawDefinition.policyRule.then.details.roleDefinitionIds)
+    }
+    $version = $null
+    if ($RawDefinition.version) { $version = $RawDefinition.version }
+    elseif ($RawDefinition.metadata -and $RawDefinition.metadata.version) { $version = $RawDefinition.metadata.version }
+    return [ordered]@{
+        name              = if ($RawDefinition.name) { $RawDefinition.name } else { $FallbackName }
+        id                = $RawDefinition.id
+        displayName       = $RawDefinition.displayName
+        description       = $RawDefinition.description
+        policyType        = $RawDefinition.policyType
+        mode              = $RawDefinition.mode
+        version           = $version
+        metadata          = if ($RawDefinition.metadata) { $RawDefinition.metadata } else { [ordered]@{} }
+        parameters        = if ($RawDefinition.parameters) { $RawDefinition.parameters } else { [ordered]@{} }
+        policyRule        = if ($RawDefinition.policyRule) { $RawDefinition.policyRule } else { [ordered]@{} }
+        roleDefinitionIds = $roleDefinitionIds
+    }
+}
+
+function ConvertTo-PolicyDefinitionSummary {
+    param($RawDefinition, [string] $FallbackName, [string] $Effect)
+    $conditions = @()
+    if ($RawDefinition.policyRule -and $RawDefinition.policyRule.if) {
+        $conditions = Get-PolicyRuleFieldConditions -Node $RawDefinition.policyRule.if
+    }
+    $typesSeen = [System.Collections.Generic.List[string]]::new()
+    $typesSeenSet = [System.Collections.Generic.HashSet[string]]::new()
+    $namingRules = [System.Collections.Generic.List[object]]::new()
+    $resourceGroupRules = [System.Collections.Generic.List[object]]::new()
+    $locationRules = [System.Collections.Generic.List[object]]::new()
+    $networkRules = [System.Collections.Generic.List[object]]::new()
+    $tagRules = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($cond in $conditions) {
+        $bucket = Get-PolicyRuleFieldBucket -Field ([string]$cond.field) -Value $cond.value
+        switch ($bucket) {
+            'resourceTypesAffected' {
+                $vals = if ($cond.value -is [array]) { @($cond.value) } elseif ($null -ne $cond.value) { , ($cond.value) } else { @() }
+                foreach ($v in $vals) {
+                    $vs = [string]$v
+                    if ($typesSeenSet.Add($vs)) { $typesSeen.Add($vs) }
+                }
+            }
+            'namingRules' { $namingRules.Add($cond) }
+            'resourceGroupRules' { $resourceGroupRules.Add($cond) }
+            'locationRules' { $locationRules.Add($cond) }
+            'networkRules' { $networkRules.Add($cond) }
+            'tagRules' { $tagRules.Add($cond) }
+        }
+    }
+
+    return [ordered]@{
+        definitionName        = if ($RawDefinition.name) { $RawDefinition.name } else { $FallbackName }
+        displayName           = $RawDefinition.displayName
+        effect                = if ([string]::IsNullOrEmpty($Effect)) { $null } else { $Effect }
+        resourceTypesAffected = [string[]]@($typesSeen)
+        namingRules           = @($namingRules)
+        resourceGroupRules    = @($resourceGroupRules)
+        locationRules         = @($locationRules)
+        networkRules          = @($networkRules)
+        tagRules              = @($tagRules)
+    }
+}
+
+# Distinct policy definition names referenced by the shortlist, each resolved once via
+# 'az policy definition show': scope derived from the compliance record's definitionId first,
+# then bare name, then subscription, then a user-supplied --management-group as fallbacks.
+$DefinitionsToResolve = [System.Collections.Generic.List[object]]::new()
+$seenDefNames = [System.Collections.Generic.HashSet[string]]::new()
+foreach ($entry in $RelevantDenyOrModifyWithDetail) {
+    $dn = [string]$entry.definitionName
+    if ($dn -and $seenDefNames.Add($dn)) {
+        $DefinitionsToResolve.Add([ordered]@{
+            definitionName = $dn
+            definitionId   = $entry.definitionId
+            subscriptionId = $entry.subscriptionId
+            effect         = $entry.effect
+        })
+    }
+}
+
+$PolicyDefinitionsDetail = [System.Collections.Generic.List[object]]::new()
+$PolicyDefinitionsSimplified = [System.Collections.Generic.List[object]]::new()
+foreach ($def in $DefinitionsToResolve) {
+    $name = [string]$def.definitionName
+    $scopeArgs = Get-PolicyDefinitionScopeArgs -DefinitionId ([string]$def.definitionId)
+
+    $definitionRaw = $null
+    if ($scopeArgs.Count -gt 0) {
+        $definitionRaw = Invoke-AzJson -Description "policy definition show for '$name' (derived scope)" `
+            -Arguments (@('policy', 'definition', 'show', '--name', $name) + $scopeArgs + @('-o', 'json'))
+    }
+    if (-not $definitionRaw) {
+        $definitionRaw = Invoke-AzJson -Description "policy definition show for '$name' (bare name)" `
+            -Arguments @('policy', 'definition', 'show', '--name', $name, '-o', 'json')
+    }
+    if (-not $definitionRaw -and $def.subscriptionId) {
+        $definitionRaw = Invoke-AzJson -Description "policy definition show for '$name' (subscription fallback)" `
+            -Arguments @('policy', 'definition', 'show', '--name', $name, '--subscription', [string]$def.subscriptionId, '-o', 'json')
+    }
+    if (-not $definitionRaw -and $ManagementGroup) {
+        $definitionRaw = Invoke-AzJson -Description "policy definition show for '$name' (management-group fallback)" `
+            -Arguments @('policy', 'definition', 'show', '--name', $name, '--management-group', $ManagementGroup, '-o', 'json')
+    }
+
+    if ($definitionRaw) {
+        $PolicyDefinitionsDetail.Add((ConvertTo-PolicyDefinitionDetail -RawDefinition $definitionRaw -FallbackName $name))
+        $PolicyDefinitionsSimplified.Add((ConvertTo-PolicyDefinitionSummary -RawDefinition $definitionRaw -FallbackName $name -Effect ([string]$def.effect)))
+    }
+    else {
+        Write-Warn "Unable to resolve policy definition '$name'; reporting as unresolved."
+        $PolicyDefinitionsDetail.Add([ordered]@{ name = $name; error = 'unresolved' })
+    }
+}
+
 $Policy = [ordered]@{
     assignmentsVisible            = @($AssignmentsVisible)
     effectiveFromComplianceState  = @($EffectiveCompliance)
     relevantDenyOrModify          = $RelevantDenyOrModify
     managementGroupAssignments    = @($ManagementGroupAssignments)
+    definitionsDetail             = @($PolicyDefinitionsDetail)
+    definitionsSimplified         = @($PolicyDefinitionsSimplified)
 }
 
 # ---------------------------------------------------------------------------

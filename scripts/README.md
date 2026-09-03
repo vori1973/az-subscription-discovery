@@ -92,7 +92,25 @@ Notable details:
   Reader at the assignment's scope.
 - `policy.relevantDenyOrModify` is a shortlist of policies most likely to constrain resource
   shape (matching `Deny`/`Modify` effects or name patterns like `PublicNetwork`, `LocalAuth`,
-  `SKU`, `Limit`, `Capacity`).
+  `SKU`, `Limit`, `Capacity`). Each entry includes an `assignmentDetail` field — the matching
+  record from `policy.assignmentsVisible` (`name`, `displayName`, `scope`, `policyDefinitionId`,
+  `parameters`, `enforcementMode`, `notScopes`, `nonComplianceMessages`, `identity`), or `null`
+  when the assignment isn't visible to the caller (e.g. a management-group-inherited assignment
+  outside the caller's Reader scope).
+- `policy.definitionsDetail` resolves the full policy definition (`az policy definition show`)
+  for every distinct definition referenced in `policy.relevantDenyOrModify`: `{ name, id,
+  displayName, description, policyType, mode, version, metadata, parameters, policyRule,
+  roleDefinitionIds }`. Scope is derived from the compliance record's `policyDefinitionId` path
+  first (management group or subscription), then falls back to a bare-name lookup, then the
+  scanned subscription, then a user-supplied `--management-group`/`-ManagementGroup`. A
+  definition that cannot be resolved via any of these is reported as `{ name, error: "unresolved"
+  }` instead of aborting discovery.
+- `policy.definitionsSimplified` is a best-effort constraint summary per resolved definition —
+  `{ definitionName, displayName, effect, resourceTypesAffected, namingRules,
+  resourceGroupRules, locationRules, networkRules, tagRules }` — derived by walking the
+  definition's `policyRule.if` conditions and bucketing each by its `field`. Buckets are
+  populated only when the underlying policy actually constrains that dimension; most real-world
+  policies only populate `resourceTypesAffected`.
 - `namingObserved` is best-effort pattern mining over existing resource names, explicitly labeled
   "observed" — not an enforced rule unless corroborated by an entry in `policy`.
 - `quotas` is a reserved placeholder for a future iteration (e.g. Cognitive Services / VM usage
