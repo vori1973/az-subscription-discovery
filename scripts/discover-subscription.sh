@@ -507,7 +507,55 @@ NAMING_OBSERVED_JSON=$(jq -n \
     }}')
 
 # ---------------------------------------------------------------------------
-# 5. Assemble output
+# 5. Architecture constraint synthesis (best-effort, cross-section)
+# ---------------------------------------------------------------------------
+# Runs last: reads from networking, policy, and naming sections already assembled above rather
+# than issuing any new 'az' calls itself.
+
+# Hub VNet identification: the VNet with the strictly highest number of peerings. On a tie
+# (including zero peerings for every VNet) the hub is left unidentified (null), per design.md.
+HUB_JSON=$(jq -c '
+  ([.[] | {name, resourceGroup, addressSpace, peeringCount: (.peerings | length)}]) as $counted
+  | ($counted | map(.peeringCount) | (max // 0)) as $maxCount
+  | ($counted | map(select(.peeringCount == $maxCount))) as $top
+  | if ($maxCount > 0) and (($top | length) == 1) then $top[0] else null end
+' <<<"${VNETS_JSON}")
+
+HUB_PEERING_JSON=$(jq -c '.name // null' <<<"${HUB_JSON}")
+NETWORK_RESOURCE_GROUP_JSON=$(jq -c '.resourceGroup // null' <<<"${HUB_JSON}")
+VNET_ADDRESS_SPACE_JSON=$(jq -c '.addressSpace // null' <<<"${HUB_JSON}")
+
+# resourceGroupNaming: direct pass-through of namingObserved.resourceGroups (no re-derivation).
+RESOURCE_GROUP_NAMING_JSON="${RG_NAMING_JSON}"
+
+# requiredTags: distinct tag keys referenced by any resolved definition's tagRules bucket
+# (produced by expand-policy-definitions), extracted from field values like tags['Environment']
+# or tags["Environment"] (bracket notation) or tags.Environment (dot notation).
+REQUIRED_TAGS_JSON=$(jq -c '
+  [
+    .definitionsSimplified[]? .tagRules[]? .field
+    | select(type == "string")
+    | ( try (capture("tags\\[[\u0027\"](?<k>[^\u0027\"]+)[\u0027\"]\\]")).k catch null )
+      // ( try (capture("^tags\\.(?<k>.+)$")).k catch null )
+  ]
+  | map(select(. != null))
+  | unique
+' <<<"${POLICY_JSON}")
+
+ARCHITECTURE_CONSTRAINTS_JSON=$(jq -n \
+  --argjson networkResourceGroup "${NETWORK_RESOURCE_GROUP_JSON}" \
+  --argjson resourceGroupNaming "${RESOURCE_GROUP_NAMING_JSON}" \
+  --argjson requiredTags "${REQUIRED_TAGS_JSON}" \
+  --argjson vnetAddressSpace "${VNET_ADDRESS_SPACE_JSON}" \
+  --argjson hubPeering "${HUB_PEERING_JSON}" \
+  '{networkResourceGroup: $networkResourceGroup,
+    resourceGroupNaming: $resourceGroupNaming,
+    requiredTags: $requiredTags,
+    vnetAddressSpace: $vnetAddressSpace,
+    hubPeering: $hubPeering}')
+
+# ---------------------------------------------------------------------------
+# 6. Assemble output
 # ---------------------------------------------------------------------------
 
 SUBSCRIPTIONS_JSON=$(printf '%s\n' "${SUBSCRIPTIONS[@]}" | jq -R . | jq -s .)
@@ -521,13 +569,15 @@ FINAL_JSON=$(jq -n \
   --argjson vnets "${VNETS_JSON}" \
   --argjson policy "${POLICY_JSON}" \
   --argjson namingObserved "${NAMING_OBSERVED_JSON}" \
+  --argjson architectureConstraints "${ARCHITECTURE_CONSTRAINTS_JSON}" \
   '{
     meta: {generatedAt: $generatedAt, tenantId: $tenantId, subscriptions: $subscriptions, runAs: $runAs},
     resourceGroups: $resourceGroups,
     networking: {vnets: $vnets},
     policy: $policy,
     namingObserved: $namingObserved,
-    quotas: {}
+    quotas: {},
+    architectureConstraints: $architectureConstraints
   }')
 
 if ! jq empty <<<"${FINAL_JSON}" >/dev/null 2>&1; then

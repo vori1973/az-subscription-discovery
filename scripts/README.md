@@ -77,9 +77,10 @@ are required or used anywhere in either script).
 ## Output
 
 A single JSON document with independent, best-effort top-level sections: `meta`,
-`resourceGroups`, `networking`, `policy`, `namingObserved`, and a reserved `quotas` placeholder.
-A failure or access denial while gathering one section (e.g. no management-group access) is
-logged as a warning to stderr and does not prevent the other sections from populating.
+`resourceGroups`, `networking`, `policy`, `namingObserved`, a reserved `quotas` placeholder, and
+`architectureConstraints`. A failure or access denial while gathering one section (e.g. no
+management-group access) is logged as a warning to stderr and does not prevent the other
+sections from populating.
 
 Notable details:
 
@@ -115,6 +116,21 @@ Notable details:
   "observed" — not an enforced rule unless corroborated by an entry in `policy`.
 - `quotas` is a reserved placeholder for a future iteration (e.g. Cognitive Services / VM usage
   quotas) — present but empty in this version.
+- `architectureConstraints` synthesizes cross-section, best-effort facts computed last (after
+  networking, policy, and naming) so an architect doesn't have to manually cross-reference
+  sections. It issues no additional `az` calls — it's a pure summarize step over already-
+  collected data:
+  - `hubPeering` / `networkResourceGroup`: name and resource group of the VNet identified as
+    the "hub" — the VNet with the strictly highest number of `networking.vnets[].peerings`
+    entries. Both are `null` when no VNet has any peerings, or when multiple VNets tie for the
+    highest peering count (no arbitrary pick is made).
+  - `vnetAddressSpace`: the identified hub VNet's `addressSpace`, or `null` if no hub was
+    identified.
+  - `resourceGroupNaming`: a direct pass-through of `namingObserved.resourceGroups`.
+  - `requiredTags`: the deduplicated set of tag keys referenced by any resolved policy
+    definition's `policy.definitionsSimplified[].tagRules` bucket (e.g. `tags['Environment']` →
+    `Environment`) — a best-effort extraction of tag keys referenced in policy conditions, not
+    a guarantee that every key is enforced on every resource type.
 
 ## Notes
 

@@ -577,7 +577,77 @@ $NamingObserved = [ordered]@{
 }
 
 # ---------------------------------------------------------------------------
-# 5. Assemble output
+# 5. Architecture constraint synthesis (best-effort, cross-section)
+# ---------------------------------------------------------------------------
+# Runs last: reads from networking, policy, and naming sections already assembled above rather
+# than issuing any new az calls itself.
+
+# Hub VNet identification: the VNet with the strictly highest number of peerings. On a tie
+# (including zero peerings for every VNet) the hub is left unidentified (null), per design.md.
+$VnetPeeringCounts = @($Vnets | ForEach-Object {
+    [ordered]@{
+        name          = $_.name
+        resourceGroup = $_.resourceGroup
+        addressSpace  = $_.addressSpace
+        peeringCount  = @($_.peerings).Count
+    }
+})
+
+$HubVnet = $null
+if ($VnetPeeringCounts.Count -gt 0) {
+    $maxPeeringCount = ($VnetPeeringCounts | ForEach-Object { $_.peeringCount } | Measure-Object -Maximum).Maximum
+    if ($maxPeeringCount -gt 0) {
+        $topVnets = @($VnetPeeringCounts | Where-Object { $_.peeringCount -eq $maxPeeringCount })
+        if ($topVnets.Count -eq 1) {
+            $HubVnet = $topVnets[0]
+        }
+    }
+}
+
+$HubPeering = if ($HubVnet) { $HubVnet.name } else { $null }
+$NetworkResourceGroup = if ($HubVnet) { $HubVnet.resourceGroup } else { $null }
+$VnetAddressSpace = if ($HubVnet) { $HubVnet.addressSpace } else { $null }
+
+# resourceGroupNaming: direct pass-through of namingObserved.resourceGroups (no re-derivation).
+$ResourceGroupNaming = $NamingObserved.resourceGroups
+
+# requiredTags: distinct tag keys referenced by any resolved definition's tagRules bucket
+# (produced by expand-policy-definitions), extracted from field values like tags['Environment']
+# or tags["Environment"] (bracket notation) or tags.Environment (dot notation).
+function Get-TagKeyFromField {
+    param([string] $Field)
+    if (-not $Field) { return $null }
+    if ($Field -match 'tags\[[''"](?<k>[^''"]+)[''"]\]') {
+        return $Matches['k']
+    }
+    if ($Field -match '^tags\.(?<k>.+)$') {
+        return $Matches['k']
+    }
+    return $null
+}
+
+$RequiredTagsSeen = [System.Collections.Generic.HashSet[string]]::new()
+$RequiredTagsList = [System.Collections.Generic.List[string]]::new()
+foreach ($def in $PolicyDefinitionsSimplified) {
+    foreach ($rule in @($def.tagRules)) {
+        $tagKey = Get-TagKeyFromField -Field ([string]$rule.field)
+        if ($tagKey -and $RequiredTagsSeen.Add($tagKey)) {
+            $RequiredTagsList.Add($tagKey)
+        }
+    }
+}
+$RequiredTags = [string[]]@($RequiredTagsList)
+
+$ArchitectureConstraints = [ordered]@{
+    networkResourceGroup = $NetworkResourceGroup
+    resourceGroupNaming  = $ResourceGroupNaming
+    requiredTags         = $RequiredTags
+    vnetAddressSpace     = $VnetAddressSpace
+    hubPeering           = $HubPeering
+}
+
+# ---------------------------------------------------------------------------
+# 6. Assemble output
 # ---------------------------------------------------------------------------
 
 $FinalObject = [ordered]@{
@@ -594,6 +664,7 @@ $FinalObject = [ordered]@{
     policy         = $Policy
     namingObserved = $NamingObserved
     quotas         = [ordered]@{}
+    architectureConstraints = $ArchitectureConstraints
 }
 
 try {
