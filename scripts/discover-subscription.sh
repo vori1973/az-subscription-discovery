@@ -179,9 +179,30 @@ vnet_entries_file="${SCRATCH_DIR}/vnets.jsonl"
 : > "${vnet_entries_file}"
 
 for sub in "${SUBSCRIPTIONS[@]}"; do
-  if ! vnets_raw=$(run_az_json "VNet listing for subscription ${sub}" \
+  if vnets_raw=$(run_az_json "VNet listing for subscription ${sub}" \
       az network vnet list --subscription "${sub}" -o json); then
-    continue
+    :
+  else
+    # Older Azure CLI versions require --resource-group for 'az network vnet list' (it isn't
+    # subscription-wide). Fall back to listing per resource group discovered in section 1.
+    log_info "Falling back to per-resource-group VNet listing for subscription ${sub} (subscription-wide 'az network vnet list' was rejected by this Azure CLI version)."
+    rg_names_for_sub=$(jq -r --arg sub "${sub}" '[.[] | select(.subscriptionId == $sub) | .name][]' <<<"${RESOURCE_GROUPS_JSON}")
+    per_rg_files=()
+    rg_idx=0
+    while IFS= read -r rg_name; do
+      [[ -z "${rg_name}" ]] && continue
+      rg_idx=$((rg_idx + 1))
+      if rg_vnets=$(run_az_json "VNet listing for resource group ${rg_name} (subscription ${sub})" \
+          az network vnet list --resource-group "${rg_name}" --subscription "${sub}" -o json); then
+        printf '%s' "${rg_vnets}" > "${SCRATCH_DIR}/rgvnets_${sub//[^A-Za-z0-9]/_}_${rg_idx}.json"
+        per_rg_files+=("${SCRATCH_DIR}/rgvnets_${sub//[^A-Za-z0-9]/_}_${rg_idx}.json")
+      fi
+    done <<<"${rg_names_for_sub}"
+    if [[ ${#per_rg_files[@]} -gt 0 ]]; then
+      vnets_raw=$(jq -s 'add // []' "${per_rg_files[@]}")
+    else
+      continue
+    fi
   fi
 
   while IFS= read -r vnet; do

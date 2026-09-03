@@ -147,13 +147,35 @@ $Vnets = [System.Collections.Generic.List[object]]::new()
 foreach ($sub in $Subscription) {
     $vnetsRaw = Invoke-AzJson -Description "VNet listing for subscription $sub" `
         -Arguments @('network', 'vnet', 'list', '--subscription', $sub, '-o', 'json')
-    if ($null -eq $vnetsRaw) { continue }
+    if ($null -eq $vnetsRaw) {
+        # Older Azure CLI versions require --resource-group for 'az network vnet list' (it isn't
+        # subscription-wide). Fall back to listing per resource group discovered in section 1.
+        Write-Info "Falling back to per-resource-group VNet listing for subscription $sub (subscription-wide 'az network vnet list' was rejected by this Azure CLI version)."
+        $rgNamesForSub = @($ResourceGroups | Where-Object { $_.subscriptionId -eq $sub } | ForEach-Object { $_.name })
+        $vnetsAccum = [System.Collections.Generic.List[object]]::new()
+        foreach ($rgName in $rgNamesForSub) {
+            $rgVnets = Invoke-AzJson -Description "VNet listing for resource group $rgName (subscription $sub)" `
+                -Arguments @('network', 'vnet', 'list', '--resource-group', $rgName, '--subscription', $sub, '-o', 'json')
+            foreach ($v in (ConvertTo-ArrayOrEmpty $rgVnets)) {
+                $vnetsAccum.Add($v)
+            }
+        }
+        if ($vnetsAccum.Count -eq 0) { continue }
+        $vnetsRaw = $vnetsAccum
+    }
 
     foreach ($vnet in (ConvertTo-ArrayOrEmpty $vnetsRaw)) {
         $vName = $vnet.name
         $vRg = $vnet.resourceGroup
         $vId = $vnet.id
-        $addressSpace = if ($vnet.addressSpace.addressPrefixes) { @($vnet.addressSpace.addressPrefixes) } else { @() }
+        # NOTE: assigning inside each branch (not capturing the whole if-statement's output)
+        # avoids PowerShell unwrapping a single-element array result to a bare scalar.
+        if ($vnet.addressSpace.addressPrefixes) {
+            $addressSpace = [string[]]@($vnet.addressSpace.addressPrefixes)
+        }
+        else {
+            $addressSpace = [string[]]@()
+        }
 
         $subnetsJson = @()
         $subnetsRaw = Invoke-AzJson -Description "subnet listing for VNet $vName (subscription $sub)" `
