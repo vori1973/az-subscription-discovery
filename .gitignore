@@ -1,0 +1,22 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# Secrets / local environment
+.env
+.env.*
+*.pem
+*.key
+
+# Local script output (discovery JSON contains subscription data; keep it out of version control)
+/out/
+*.discovery.json
+discovery*.json
+
+# Logs
+*.log
