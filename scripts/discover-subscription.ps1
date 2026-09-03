@@ -44,6 +44,11 @@ function Write-Warn {
     Write-Warning $Message
 }
 
+function Write-Info {
+    param([string] $Message)
+    [Console]::Error.WriteLine("[info] $Message")
+}
+
 function Write-ErrorAndExit {
     param([string] $Message, [int] $Code = 1)
     Write-Error $Message
@@ -341,8 +346,22 @@ catch {
 }
 
 if ($Output) {
-    Set-Content -Path $Output -Value $FinalJson -NoNewline
-    Write-Warn "Discovery output written to $Output"
+    $outputDir = Split-Path -Path $Output -Parent
+    if ($outputDir -and -not (Test-Path -Path $outputDir -PathType Container)) {
+        try {
+            $null = New-Item -Path $outputDir -ItemType Directory -Force -ErrorAction Stop
+        }
+        catch {
+            Write-ErrorAndExit "Failed to create output directory '$outputDir': $($_.Exception.Message)"
+        }
+    }
+    try {
+        Set-Content -Path $Output -Value $FinalJson -NoNewline -ErrorAction Stop
+        Write-Info "Discovery output written to $Output"
+    }
+    catch {
+        Write-ErrorAndExit "Failed to write output to '$Output': $($_.Exception.Message)"
+    }
 }
 else {
     Write-Output $FinalJson

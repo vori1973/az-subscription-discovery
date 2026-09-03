@@ -46,6 +46,10 @@ log_warn() {
   echo "[warn] $*" >&2
 }
 
+log_info() {
+  echo "[info] $*" >&2
+}
+
 log_error() {
   echo "[error] $*" >&2
 }
@@ -348,8 +352,19 @@ if ! jq empty <<<"${FINAL_JSON}" >/dev/null 2>&1; then
 fi
 
 if [[ -n "${OUTPUT_PATH}" ]]; then
-  printf '%s\n' "${FINAL_JSON}" | jq '.' > "${OUTPUT_PATH}"
-  log_warn "Discovery output written to ${OUTPUT_PATH}"
+  output_dir=$(dirname -- "${OUTPUT_PATH}")
+  if [[ -n "${output_dir}" && "${output_dir}" != "." && ! -d "${output_dir}" ]]; then
+    if ! mkdir -p -- "${output_dir}" 2>/dev/null; then
+      log_error "Failed to create output directory '${output_dir}'."
+      exit 1
+    fi
+  fi
+  if printf '%s\n' "${FINAL_JSON}" | jq '.' > "${OUTPUT_PATH}" 2>"${SCRATCH_DIR}/write_err"; then
+    log_info "Discovery output written to ${OUTPUT_PATH}"
+  else
+    log_error "Failed to write output to '${OUTPUT_PATH}': $(tr '\n' ' ' < "${SCRATCH_DIR}/write_err")"
+    exit 1
+  fi
 else
   printf '%s\n' "${FINAL_JSON}" | jq '.'
 fi
