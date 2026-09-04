@@ -69,18 +69,18 @@ reporting each zone's name and the names of the VNets linked to it.
 ### Requirement: Subscription and network quota usage
 The system SHALL report real compute quota usage (`az vm list-usage`) and network quota usage
 (`az network list-usages`) for each Azure region already observed among the subscription's
-discovered VNets, falling back to the subscription's default location when no VNets were
+discovered resource groups, falling back to a default location when no resource groups were
 discovered. Each reported quota entry SHALL include its region, name, current value, and limit.
 This replaces the previously placeholder `quotas` section with real data.
 
-#### Scenario: Regions derived from discovered VNets
-- **WHEN** the subscription has VNets discovered in one or more regions
+#### Scenario: Regions derived from discovered resource groups
+- **WHEN** the subscription has resource groups discovered in one or more regions
 - **THEN** the `quotas` section reports compute and network usage for each of those regions
 
-#### Scenario: No VNets discovered
-- **WHEN** the subscription has no discovered VNets
-- **THEN** the `quotas` section reports compute and network usage for the subscription's default
-  location instead of being empty
+#### Scenario: No resource groups discovered
+- **WHEN** the subscription has no discovered resource groups
+- **THEN** the `quotas` section reports compute and network usage for a default location instead
+  of being empty
 
 #### Scenario: Quota listing access denied
 - **WHEN** the caller lacks permission to list usage for a given region

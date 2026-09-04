@@ -148,9 +148,12 @@ unless it is corroborated by a policy definition found in the policy section.
 
 ### Requirement: Structured JSON output
 The system SHALL emit a single JSON document containing `meta`, `resourceGroups`, `networking`,
-`policy`, `namingObserved`, `quotas`, and `architectureConstraints` top-level sections, with
-`quotas` reserved as a placeholder for a future iteration and `architectureConstraints`
-containing best-effort, synthesized cross-section facts (see the
+`policy`, `rbac`, `providers`, `privateEndpoints`, `privateDns`, `namingObserved`, `quotas`, and
+`architectureConstraints` top-level sections. `rbac`, `providers`, `privateEndpoints`, and
+`privateDns` contain the RBAC, provider registration, private endpoint, and private DNS discovery
+results (see the `platform-readiness-discovery` capability). `quotas` contains real
+compute/network usage data (see `platform-readiness-discovery`) rather than being a placeholder.
+`architectureConstraints` contains best-effort, synthesized cross-section facts (see the
 `architecture-constraint-synthesis` capability).
 
 #### Scenario: Output is machine-parsable
