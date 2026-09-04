@@ -115,6 +115,34 @@ def render_networking(data):
     return "\n".join(lines) + "\n"
 
 
+def _sanitize_table_cell(text):
+    """Collapse whitespace/newlines and escape pipes so a value is safe in a Markdown table cell."""
+    return " ".join(str(text).split()).replace("|", "\\|")
+
+
+def _policy_description(entry, definition_detail):
+    """Best-effort human-readable description of a policy, sourced from the actual policy
+    definition rather than its (possibly cryptic or non-descriptive) name.
+
+    Preference order: the definition's real `description`, then its `displayName` (from the
+    resolved definition detail, falling back to the assignment's own displayName), then a
+    placeholder noting no description was available.
+    """
+    if definition_detail:
+        description = definition_detail.get("description")
+        if description:
+            return _sanitize_table_cell(description)
+        display_name = definition_detail.get("displayName")
+        if display_name:
+            return _sanitize_table_cell(display_name)
+
+    assignment_display_name = (entry.get("assignmentDetail") or {}).get("displayName")
+    if assignment_display_name:
+        return _sanitize_table_cell(assignment_display_name)
+
+    return "_(no description available)_"
+
+
 def render_policy(data):
     if "policy" not in data:
         return section_unavailable("Policy Constraints")
@@ -123,7 +151,22 @@ def render_policy(data):
     constraints = data.get("architectureConstraints") or {}
     required_tags = constraints.get("requiredTags") or []
 
+    definitions_by_name = {
+        d.get("name"): d for d in (policy.get("definitionsDetail") or []) if d.get("name")
+    }
+
     lines = ["## Policy Constraints", "", f"Deny/Modify policies: {len(deny_modify)}"]
+    lines.append(
+        "- **How to read this**: every policy below is actively assigned and enforced right "
+        "now. `deny` blocks creation/update of a non-compliant resource; `modify` silently "
+        "rewrites the resource (e.g. adds a required tag) instead of blocking it. The "
+        "**Description** column is pulled from the policy definition itself (its `description`, "
+        "falling back to its `displayName`) — do not rely on the definition name alone to guess "
+        "intent, since not every customer names definitions descriptively. To confirm a given "
+        "convention (e.g. network/NSG/route naming) is enforced, look for it here — if it's "
+        "listed, it's live; if not, that convention isn't policy-enforced in this subscription. "
+        "Run `az policy definition show --name <definition>` for the exact rule logic."
+    )
     if required_tags:
         lines.append(f"- **Required tags** (from policy): {', '.join(required_tags)}")
     else:
@@ -131,12 +174,12 @@ def render_policy(data):
     lines.append("")
 
     if deny_modify:
-        lines.append("| Definition | Effect |")
-        lines.append("|---|---|")
+        lines.append("| Definition | Effect | Description |")
+        lines.append("|---|---|---|")
         for entry in deny_modify:
-            lines.append(
-                f"| {entry.get('definitionName', '')} | {entry.get('effect', '')} |"
-            )
+            name = entry.get("definitionName", "")
+            description = _policy_description(entry, definitions_by_name.get(name))
+            lines.append(f"| {name} | {entry.get('effect', '')} | {description} |")
     return "\n".join(lines) + "\n"
 
 
@@ -239,7 +282,10 @@ def find_risks(data, quota_threshold):
         if state != "Registered":
             risks.append(
                 f"Provider `{provider.get('namespace', '')}` is not registered "
-                f"(state: {state})"
+                f"(state: {state}) — no resource of this type has been deployed in this "
+                f"subscription yet; not a blocker, but register it (`az provider register "
+                f"--namespace {provider.get('namespace', '')}`) before first deploying this "
+                f"resource type"
             )
 
     quotas = data.get("quotas") or []
@@ -260,7 +306,13 @@ def find_risks(data, quota_threshold):
 
 def render_risks(data, quota_threshold):
     risks = find_risks(data, quota_threshold)
-    lines = ["## Readiness Risks & Gaps", ""]
+    lines = [
+        "## Readiness Risks & Gaps",
+        "",
+        "_Informational pre-flight checks — none of these block a deployment by themselves; "
+        "each entry says what to do before relying on that capability._",
+        "",
+    ]
     if not risks:
         lines.append("No risks found.")
     else:
