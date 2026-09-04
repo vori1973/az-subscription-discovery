@@ -463,19 +463,31 @@ if [[ -n "${MANAGEMENT_GROUP}" ]]; then
   fi
 fi
 
+# Policy sections (especially definitionsDetail) can exceed the OS's single-argument length
+# limit (MAX_ARG_STRLEN, typically 128KB on Linux) if passed via --argjson on the command line.
+# Write each section to a scratch file and load it with --slurpfile instead, which has no such limit.
+policy_json_dir="${SCRATCH_DIR}/policy_json"
+mkdir -p "${policy_json_dir}"
+printf '%s' "${ASSIGNMENTS_VISIBLE_JSON}" > "${policy_json_dir}/assignmentsVisible.json"
+printf '%s' "${EFFECTIVE_COMPLIANCE_JSON}" > "${policy_json_dir}/effectiveFromComplianceState.json"
+printf '%s' "${RELEVANT_DENY_MODIFY_JSON}" > "${policy_json_dir}/relevantDenyOrModify.json"
+printf '%s' "${MG_ASSIGNMENTS_JSON}" > "${policy_json_dir}/managementGroupAssignments.json"
+printf '%s' "${POLICY_DEFINITIONS_DETAIL_JSON}" > "${policy_json_dir}/definitionsDetail.json"
+printf '%s' "${POLICY_DEFINITIONS_SIMPLIFIED_JSON}" > "${policy_json_dir}/definitionsSimplified.json"
+
 POLICY_JSON=$(jq -n \
-  --argjson assignmentsVisible "${ASSIGNMENTS_VISIBLE_JSON}" \
-  --argjson effectiveFromComplianceState "${EFFECTIVE_COMPLIANCE_JSON}" \
-  --argjson relevantDenyOrModify "${RELEVANT_DENY_MODIFY_JSON}" \
-  --argjson managementGroupAssignments "${MG_ASSIGNMENTS_JSON}" \
-  --argjson definitionsDetail "${POLICY_DEFINITIONS_DETAIL_JSON}" \
-  --argjson definitionsSimplified "${POLICY_DEFINITIONS_SIMPLIFIED_JSON}" \
-  '{assignmentsVisible: $assignmentsVisible,
-    effectiveFromComplianceState: $effectiveFromComplianceState,
-    relevantDenyOrModify: $relevantDenyOrModify,
-    managementGroupAssignments: $managementGroupAssignments,
-    definitionsDetail: $definitionsDetail,
-    definitionsSimplified: $definitionsSimplified}')
+  --slurpfile assignmentsVisible "${policy_json_dir}/assignmentsVisible.json" \
+  --slurpfile effectiveFromComplianceState "${policy_json_dir}/effectiveFromComplianceState.json" \
+  --slurpfile relevantDenyOrModify "${policy_json_dir}/relevantDenyOrModify.json" \
+  --slurpfile managementGroupAssignments "${policy_json_dir}/managementGroupAssignments.json" \
+  --slurpfile definitionsDetail "${policy_json_dir}/definitionsDetail.json" \
+  --slurpfile definitionsSimplified "${policy_json_dir}/definitionsSimplified.json" \
+  '{assignmentsVisible: $assignmentsVisible[0],
+    effectiveFromComplianceState: $effectiveFromComplianceState[0],
+    relevantDenyOrModify: $relevantDenyOrModify[0],
+    managementGroupAssignments: $managementGroupAssignments[0],
+    definitionsDetail: $definitionsDetail[0],
+    definitionsSimplified: $definitionsSimplified[0]}')
 
 # ---------------------------------------------------------------------------
 # 4. Platform readiness discovery (RBAC, providers, private endpoints, private DNS, quotas)
@@ -530,11 +542,17 @@ RBAC_OWNERSHIP_SUMMARY_JSON=$(jq -c '
   | from_entries
 ' <<<"${RBAC_ASSIGNMENTS_JSON}")
 
+rbac_json_dir="${SCRATCH_DIR}/rbac_json"
+mkdir -p "${rbac_json_dir}"
+printf '%s' "${RBAC_ASSIGNMENTS_JSON}" > "${rbac_json_dir}/assignments.json"
+printf '%s' "${RBAC_CUSTOM_ROLES_JSON}" > "${rbac_json_dir}/customRoles.json"
+printf '%s' "${RBAC_OWNERSHIP_SUMMARY_JSON}" > "${rbac_json_dir}/ownershipSummary.json"
+
 RBAC_JSON=$(jq -n \
-  --argjson assignments "${RBAC_ASSIGNMENTS_JSON}" \
-  --argjson customRoles "${RBAC_CUSTOM_ROLES_JSON}" \
-  --argjson ownershipSummary "${RBAC_OWNERSHIP_SUMMARY_JSON}" \
-  '{assignments: $assignments, customRoles: $customRoles, ownershipSummary: $ownershipSummary}')
+  --slurpfile assignments "${rbac_json_dir}/assignments.json" \
+  --slurpfile customRoles "${rbac_json_dir}/customRoles.json" \
+  --slurpfile ownershipSummary "${rbac_json_dir}/ownershipSummary.json" \
+  '{assignments: $assignments[0], customRoles: $customRoles[0], ownershipSummary: $ownershipSummary[0]}')
 
 # --- 4b. Resource provider registration (fixed priority list) ---
 
