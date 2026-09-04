@@ -162,3 +162,49 @@ Notable details:
   call is scoped explicitly with `--subscription`/`--scope`.
 - Both scripts have been verified to produce equivalent JSON output against the same live
   subscription.
+
+## Readiness report generator
+
+**`generate-readiness-report.py`** (Python 3) turns an existing discovery JSON file into a
+human-readable Markdown report, organized by topic rather than mirroring the raw JSON structure.
+It is a pure, offline transform — it issues no Azure API calls and does not modify the input
+file, so it can be re-run repeatedly (e.g. with a different quota threshold) without re-running
+discovery.
+
+```bash
+# Print the report to stdout
+python3 scripts/generate-readiness-report.py out/discovery.json
+
+# Write the report to a file
+python3 scripts/generate-readiness-report.py out/discovery.json -o report.md
+
+# Flag quota entries at or above 90% usage instead of the 80% default
+python3 scripts/generate-readiness-report.py out/discovery.json --quota-threshold 0.9
+```
+
+| Option | Description |
+| --- | --- |
+| `input` (positional) | Path to a discovery JSON file produced by either script |
+| `-o`, `--output` | Path to write the Markdown report (default: stdout) |
+| `--quota-threshold` | Usage ratio (`currentValue`/`limit`) at or above which a quota entry is flagged as a risk (default: `0.8`) |
+
+Report sections:
+
+- **Subscription** — `meta` (tenant, subscriptions scanned, generation time).
+- **Readiness Risks & Gaps** — always present, even when empty (explicitly states "No risks
+  found"). Flags: resource providers not `Registered`, quota entries at/above the usage
+  threshold, and no identified hub VNet (`architectureConstraints.hubPeering` is `null`).
+- **Resource Groups** — count and a name/location table.
+- **Networking Topology** — VNet count, identified hub VNet (if any), and a per-VNet address
+  space/peering-count table.
+- **Policy Constraints** — count of Deny/Modify policies and the required tag keys derived from
+  policy, plus a definition/effect table.
+- **RBAC Ownership** — assignment and custom role counts, plus the per-role ownership summary.
+- **Resource Provider Registration** — every tracked provider namespace and its state.
+- **Private Endpoints & DNS** — endpoint and zone counts, and any DNS zones with no linked
+  VNets.
+- **Quota Headroom** — total entries, grouped by region.
+
+If the input JSON predates a given top-level section (e.g. output generated before `rbac` was
+added), that section renders as "Not available in this discovery output" instead of failing.
+
