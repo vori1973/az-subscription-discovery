@@ -478,7 +478,200 @@ POLICY_JSON=$(jq -n \
     definitionsSimplified: $definitionsSimplified}')
 
 # ---------------------------------------------------------------------------
-# 4. Observed naming conventions (best-effort, not authoritative)
+# 4. Platform readiness discovery (RBAC, providers, private endpoints, private DNS, quotas)
+# ---------------------------------------------------------------------------
+# Each of these is independent and best-effort: a failure or access denial in one SHALL NOT
+# prevent any other section (new or pre-existing) from being gathered and reported.
+
+# --- 4a. RBAC: role assignments + custom role definitions ---
+
+rbac_assignment_files=()
+rbac_customrole_files=()
+idx=0
+for sub in "${SUBSCRIPTIONS[@]}"; do
+  idx=$((idx + 1))
+
+  if assignments_raw=$(run_az_json "role assignment listing for subscription ${sub}" \
+      az role assignment list --all --subscription "${sub}" -o json); then
+    assignments_annotated=$(jq --arg sub "${sub}" '[.[] | {
+        principalId: (.principalId // null),
+        principalType: (.principalType // null),
+        roleDefinitionName: (.roleDefinitionName // null),
+        scope: (.scope // null),
+        subscriptionId: $sub
+      }]' <<<"${assignments_raw}")
+  else
+    assignments_annotated="[]"
+  fi
+  printf '%s' "${assignments_annotated}" > "${SCRATCH_DIR}/rbac_assign_${idx}.json"
+  rbac_assignment_files+=("${SCRATCH_DIR}/rbac_assign_${idx}.json")
+
+  if customroles_raw=$(run_az_json "custom role definition listing for subscription ${sub}" \
+      az role definition list --custom-role-only true --subscription "${sub}" -o json); then
+    customroles_annotated=$(jq --arg sub "${sub}" '[.[] | {
+        name: (.roleName // .name // null),
+        id: (.id // null),
+        assignableScopes: (.assignableScopes // []),
+        subscriptionId: $sub
+      }]' <<<"${customroles_raw}")
+  else
+    customroles_annotated="[]"
+  fi
+  printf '%s' "${customroles_annotated}" > "${SCRATCH_DIR}/rbac_customrole_${idx}.json"
+  rbac_customrole_files+=("${SCRATCH_DIR}/rbac_customrole_${idx}.json")
+done
+
+RBAC_ASSIGNMENTS_JSON=$(jq -s 'add // []' "${rbac_assignment_files[@]}")
+RBAC_CUSTOM_ROLES_JSON=$(jq -s 'add // [] | unique_by(.id)' "${rbac_customrole_files[@]}")
+
+RBAC_OWNERSHIP_SUMMARY_JSON=$(jq -c '
+  group_by(.roleDefinitionName)
+  | map({key: (.[0].roleDefinitionName // "unknown"), value: length})
+  | from_entries
+' <<<"${RBAC_ASSIGNMENTS_JSON}")
+
+RBAC_JSON=$(jq -n \
+  --argjson assignments "${RBAC_ASSIGNMENTS_JSON}" \
+  --argjson customRoles "${RBAC_CUSTOM_ROLES_JSON}" \
+  --argjson ownershipSummary "${RBAC_OWNERSHIP_SUMMARY_JSON}" \
+  '{assignments: $assignments, customRoles: $customRoles, ownershipSummary: $ownershipSummary}')
+
+# --- 4b. Resource provider registration (fixed priority list) ---
+
+PRIORITY_PROVIDERS_JSON='["Microsoft.CognitiveServices","Microsoft.ApiManagement","Microsoft.Search","Microsoft.ContainerService","Microsoft.KeyVault","Microsoft.Web","Microsoft.Network","Microsoft.OperationalInsights"]'
+
+provider_files=()
+idx=0
+for sub in "${SUBSCRIPTIONS[@]}"; do
+  idx=$((idx + 1))
+  if providers_raw=$(run_az_json "provider listing for subscription ${sub}" \
+      az provider list --subscription "${sub}" -o json); then
+    providers_annotated=$(jq --arg sub "${sub}" --argjson priority "${PRIORITY_PROVIDERS_JSON}" '
+      ($priority | map({key: ., value: "NotFound"}) | from_entries) as $defaults
+      | ([.[] | {key: .namespace, value: (.registrationState // "Unknown")}] | from_entries) as $found
+      | ($defaults + $found) as $merged
+      | [$priority[] | {namespace: ., registrationState: $merged[.], subscriptionId: $sub}]
+    ' <<<"${providers_raw}")
+  else
+    providers_annotated=$(jq -n --arg sub "${sub}" --argjson priority "${PRIORITY_PROVIDERS_JSON}" \
+      '[$priority[] | {namespace: ., registrationState: "Unknown", subscriptionId: $sub}]')
+  fi
+  printf '%s' "${providers_annotated}" > "${SCRATCH_DIR}/providers_${idx}.json"
+  provider_files+=("${SCRATCH_DIR}/providers_${idx}.json")
+done
+PROVIDERS_JSON=$(jq -s 'add // []' "${provider_files[@]}")
+
+# --- 4c. Private Endpoint discovery ---
+
+pe_files=()
+idx=0
+for sub in "${SUBSCRIPTIONS[@]}"; do
+  idx=$((idx + 1))
+  if pe_raw=$(run_az_json "private endpoint listing for subscription ${sub}" \
+      az network private-endpoint list --subscription "${sub}" -o json); then
+    pe_annotated=$(jq --arg sub "${sub}" '[.[] | {
+        name: .name,
+        resourceGroup: .resourceGroup,
+        subnet: (.subnet.id // null),
+        subscriptionId: $sub,
+        connections: [
+          (.privateLinkServiceConnections // [])[]?,
+          (.manualPrivateLinkServiceConnections // [])[]?
+          | {targetResourceId: (.privateLinkServiceId // null),
+             status: (.privateLinkServiceConnectionState.status // null)}
+        ]
+      }]' <<<"${pe_raw}")
+  else
+    pe_annotated="[]"
+  fi
+  printf '%s' "${pe_annotated}" > "${SCRATCH_DIR}/pe_${idx}.json"
+  pe_files+=("${SCRATCH_DIR}/pe_${idx}.json")
+done
+PRIVATE_ENDPOINTS_JSON=$(jq -s 'add // []' "${pe_files[@]}")
+
+# --- 4d. Private DNS discovery (zones + VNet links) ---
+
+dns_entries_file="${SCRATCH_DIR}/dns_zones.jsonl"
+: > "${dns_entries_file}"
+
+for sub in "${SUBSCRIPTIONS[@]}"; do
+  if zones_raw=$(run_az_json "private DNS zone listing for subscription ${sub}" \
+      az network private-dns zone list --subscription "${sub}" -o json); then
+    :
+  else
+    zones_raw="[]"
+  fi
+
+  while IFS= read -r zone; do
+    [[ -z "${zone}" ]] && continue
+    z_name=$(jq -r '.name' <<<"${zone}")
+    z_rg=$(jq -r '.resourceGroup' <<<"${zone}")
+    if links_raw=$(run_az_json "private DNS VNet link listing for zone ${z_name} (subscription ${sub})" \
+        az network private-dns link vnet list --resource-group "${z_rg}" --zone-name "${z_name}" \
+        --subscription "${sub}" -o json); then
+      linked_vnets=$(jq -c '
+        [.[] | (.virtualNetwork.id // "") | (try capture("/virtualNetworks/(?<n>[^/]+)$"; "i").n catch null)]
+        | map(select(. != null))
+      ' <<<"${links_raw}")
+    else
+      linked_vnets="[]"
+    fi
+    jq -n --arg name "${z_name}" --arg rg "${z_rg}" --arg sub "${sub}" --argjson linkedVnets "${linked_vnets}" \
+      '{name: $name, resourceGroup: $rg, subscriptionId: $sub, linkedVnets: $linkedVnets}' \
+      >> "${dns_entries_file}"
+  done < <(jq -c '.[]' <<<"${zones_raw}")
+done
+
+if [[ -s "${dns_entries_file}" ]]; then
+  PRIVATE_DNS_JSON=$(jq -s '.' "${dns_entries_file}")
+else
+  PRIVATE_DNS_JSON="[]"
+fi
+
+# --- 4e. Quota/usage discovery ---
+# Regions are derived from already-discovered resource group locations (deduplicated), avoiding
+# any new region-discovery API call. Falls back to a fixed default region when the subscription
+# has no discovered resource groups (e.g. a brand-new, empty subscription).
+
+QUOTA_REGIONS_JSON=$(jq -c '[.[].location] | map(select(. != null and . != "")) | unique' <<<"${RESOURCE_GROUPS_JSON}")
+if [[ "$(jq 'length' <<<"${QUOTA_REGIONS_JSON}")" -eq 0 ]]; then
+  QUOTA_REGIONS_JSON='["eastus"]'
+  log_info "No resource group locations discovered; defaulting quota region to eastus."
+fi
+
+quota_entries_file="${SCRATCH_DIR}/quotas.jsonl"
+: > "${quota_entries_file}"
+
+for sub in "${SUBSCRIPTIONS[@]}"; do
+  while IFS= read -r region; do
+    [[ -z "${region}" ]] && continue
+    if vm_usage_raw=$(run_az_json "VM usage listing for region ${region} (subscription ${sub})" \
+        az vm list-usage --location "${region}" --subscription "${sub}" -o json); then
+      jq -c --arg region "${region}" --arg sub "${sub}" --arg category "compute" '
+        .[] | {region: $region, category: $category,
+               name: (.localName // .name.value // .name // null),
+               currentValue: .currentValue, limit: .limit, subscriptionId: $sub}
+      ' <<<"${vm_usage_raw}" >> "${quota_entries_file}"
+    fi
+    if net_usage_raw=$(run_az_json "network usage listing for region ${region} (subscription ${sub})" \
+        az network list-usages --location "${region}" --subscription "${sub}" -o json); then
+      jq -c --arg region "${region}" --arg sub "${sub}" --arg category "network" '
+        .[] | {region: $region, category: $category,
+               name: (.localName // .name.value // .name // null),
+               currentValue: .currentValue, limit: .limit, subscriptionId: $sub}
+      ' <<<"${net_usage_raw}" >> "${quota_entries_file}"
+    fi
+  done < <(jq -r '.[]' <<<"${QUOTA_REGIONS_JSON}")
+done
+
+if [[ -s "${quota_entries_file}" ]]; then
+  QUOTAS_JSON=$(jq -s '.' "${quota_entries_file}")
+else
+  QUOTAS_JSON="[]"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Observed naming conventions (best-effort, not authoritative)
 # ---------------------------------------------------------------------------
 
 RG_NAMES_JSON=$(jq -c '[.[].name]' <<<"${RESOURCE_GROUPS_JSON}")
@@ -507,7 +700,7 @@ NAMING_OBSERVED_JSON=$(jq -n \
     }}')
 
 # ---------------------------------------------------------------------------
-# 5. Architecture constraint synthesis (best-effort, cross-section)
+# 6. Architecture constraint synthesis (best-effort, cross-section)
 # ---------------------------------------------------------------------------
 # Runs last: reads from networking, policy, and naming sections already assembled above rather
 # than issuing any new 'az' calls itself.
@@ -555,32 +748,58 @@ ARCHITECTURE_CONSTRAINTS_JSON=$(jq -n \
     hubPeering: $hubPeering}')
 
 # ---------------------------------------------------------------------------
-# 6. Assemble output
+# 7. Assemble output
 # ---------------------------------------------------------------------------
 
 SUBSCRIPTIONS_JSON=$(printf '%s\n' "${SUBSCRIPTIONS[@]}" | jq -R . | jq -s .)
+
+# Large sections (e.g. quotas, policy) can exceed the OS's single-argument length limit
+# (MAX_ARG_STRLEN, typically 128KB on Linux) if passed via --argjson on the command line. Write
+# each section to a scratch file and load it with --slurpfile instead, which has no such limit.
+final_json_dir="${SCRATCH_DIR}/final"
+mkdir -p "${final_json_dir}"
+printf '%s' "${SUBSCRIPTIONS_JSON}" > "${final_json_dir}/subscriptions.json"
+printf '%s' "${RESOURCE_GROUPS_JSON}" > "${final_json_dir}/resourceGroups.json"
+printf '%s' "${VNETS_JSON}" > "${final_json_dir}/vnets.json"
+printf '%s' "${POLICY_JSON}" > "${final_json_dir}/policy.json"
+printf '%s' "${RBAC_JSON}" > "${final_json_dir}/rbac.json"
+printf '%s' "${PROVIDERS_JSON}" > "${final_json_dir}/providers.json"
+printf '%s' "${PRIVATE_ENDPOINTS_JSON}" > "${final_json_dir}/privateEndpoints.json"
+printf '%s' "${PRIVATE_DNS_JSON}" > "${final_json_dir}/privateDns.json"
+printf '%s' "${QUOTAS_JSON}" > "${final_json_dir}/quotas.json"
+printf '%s' "${NAMING_OBSERVED_JSON}" > "${final_json_dir}/namingObserved.json"
+printf '%s' "${ARCHITECTURE_CONSTRAINTS_JSON}" > "${final_json_dir}/architectureConstraints.json"
 
 FINAL_JSON=$(jq -n \
   --arg generatedAt "${GENERATED_AT}" \
   --arg tenantId "${TENANT_ID}" \
   --arg runAs "${RUN_AS}" \
-  --argjson subscriptions "${SUBSCRIPTIONS_JSON}" \
-  --argjson resourceGroups "${RESOURCE_GROUPS_JSON}" \
-  --argjson vnets "${VNETS_JSON}" \
-  --argjson policy "${POLICY_JSON}" \
-  --argjson namingObserved "${NAMING_OBSERVED_JSON}" \
-  --argjson architectureConstraints "${ARCHITECTURE_CONSTRAINTS_JSON}" \
+  --slurpfile subscriptions "${final_json_dir}/subscriptions.json" \
+  --slurpfile resourceGroups "${final_json_dir}/resourceGroups.json" \
+  --slurpfile vnets "${final_json_dir}/vnets.json" \
+  --slurpfile policy "${final_json_dir}/policy.json" \
+  --slurpfile rbac "${final_json_dir}/rbac.json" \
+  --slurpfile providers "${final_json_dir}/providers.json" \
+  --slurpfile privateEndpoints "${final_json_dir}/privateEndpoints.json" \
+  --slurpfile privateDns "${final_json_dir}/privateDns.json" \
+  --slurpfile quotas "${final_json_dir}/quotas.json" \
+  --slurpfile namingObserved "${final_json_dir}/namingObserved.json" \
+  --slurpfile architectureConstraints "${final_json_dir}/architectureConstraints.json" \
   '{
-    meta: {generatedAt: $generatedAt, tenantId: $tenantId, subscriptions: $subscriptions, runAs: $runAs},
-    resourceGroups: $resourceGroups,
-    networking: {vnets: $vnets},
-    policy: $policy,
-    namingObserved: $namingObserved,
-    quotas: {},
-    architectureConstraints: $architectureConstraints
+    meta: {generatedAt: $generatedAt, tenantId: $tenantId, subscriptions: $subscriptions[0], runAs: $runAs},
+    resourceGroups: $resourceGroups[0],
+    networking: {vnets: $vnets[0]},
+    policy: $policy[0],
+    rbac: $rbac[0],
+    providers: $providers[0],
+    privateEndpoints: $privateEndpoints[0],
+    privateDns: $privateDns[0],
+    namingObserved: $namingObserved[0],
+    quotas: $quotas[0],
+    architectureConstraints: $architectureConstraints[0]
   }')
 
-if ! jq empty <<<"${FINAL_JSON}" >/dev/null 2>&1; then
+if [[ -z "${FINAL_JSON}" ]] || ! jq empty <<<"${FINAL_JSON}" >/dev/null 2>&1; then
   log_error "Assembled output failed JSON validation; aborting before write."
   exit 1
 fi

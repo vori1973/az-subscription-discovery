@@ -550,7 +550,188 @@ $Policy = [ordered]@{
 }
 
 # ---------------------------------------------------------------------------
-# 4. Observed naming conventions (best-effort, not authoritative)
+# 4. Platform readiness discovery (RBAC, providers, private endpoints, private DNS, quotas)
+# ---------------------------------------------------------------------------
+# Each of these is independent and best-effort: a failure or access denial in one SHALL NOT
+# prevent any other section (new or pre-existing) from being gathered and reported.
+
+# --- 4a. RBAC: role assignments + custom role definitions ---
+
+$RbacAssignments = [System.Collections.Generic.List[object]]::new()
+$RbacCustomRoles = [System.Collections.Generic.List[object]]::new()
+$seenCustomRoleIds = [System.Collections.Generic.HashSet[string]]::new()
+
+foreach ($sub in $Subscription) {
+    $assignRaw = Invoke-AzJson -Description "role assignment listing for subscription $sub" `
+        -Arguments @('role', 'assignment', 'list', '--all', '--subscription', $sub, '-o', 'json')
+    foreach ($a in (ConvertTo-ArrayOrEmpty $assignRaw)) {
+        $RbacAssignments.Add([ordered]@{
+            principalId         = $a.principalId
+            principalType       = $a.principalType
+            roleDefinitionName  = $a.roleDefinitionName
+            scope               = $a.scope
+            subscriptionId      = $sub
+        })
+    }
+
+    $customRaw = Invoke-AzJson -Description "custom role definition listing for subscription $sub" `
+        -Arguments @('role', 'definition', 'list', '--custom-role-only', 'true', '--subscription', $sub, '-o', 'json')
+    foreach ($r in (ConvertTo-ArrayOrEmpty $customRaw)) {
+        $roleId = if ($r.id) { [string]$r.id } else { $null }
+        if ($roleId -and $seenCustomRoleIds.Add($roleId)) {
+            $roleName = if ($r.roleName) { $r.roleName } else { $r.name }
+            $RbacCustomRoles.Add([ordered]@{
+                name             = $roleName
+                id               = $r.id
+                assignableScopes = if ($r.assignableScopes) { @($r.assignableScopes) } else { @() }
+                subscriptionId   = $sub
+            })
+        }
+    }
+}
+
+# NOTE: Group-Object -Property, like Measure-Object -Property, silently fails to group by an
+# ordered-Hashtable property (it treats the whole pipeline as one group with a blank key).
+# Extract the property values first, then group the resulting scalar strings instead.
+$RbacOwnershipSummary = [ordered]@{}
+foreach ($grp in ($RbacAssignments | ForEach-Object { [string]$_.roleDefinitionName } | Group-Object)) {
+    $key = if ($grp.Name) { $grp.Name } else { 'unknown' }
+    $RbacOwnershipSummary[$key] = $grp.Count
+}
+
+$Rbac = [ordered]@{
+    assignments      = @($RbacAssignments)
+    customRoles      = @($RbacCustomRoles)
+    ownershipSummary = $RbacOwnershipSummary
+}
+
+# --- 4b. Resource provider registration (fixed priority list) ---
+
+$PriorityProviders = @(
+    'Microsoft.CognitiveServices', 'Microsoft.ApiManagement', 'Microsoft.Search',
+    'Microsoft.ContainerService', 'Microsoft.KeyVault', 'Microsoft.Web',
+    'Microsoft.Network', 'Microsoft.OperationalInsights'
+)
+
+$Providers = [System.Collections.Generic.List[object]]::new()
+foreach ($sub in $Subscription) {
+    $providersRaw = Invoke-AzJson -Description "provider listing for subscription $sub" `
+        -Arguments @('provider', 'list', '--subscription', $sub, '-o', 'json')
+    $providersByNamespace = @{}
+    foreach ($p in (ConvertTo-ArrayOrEmpty $providersRaw)) {
+        if ($p.namespace) {
+            $providersByNamespace[[string]$p.namespace] = if ($p.registrationState) { $p.registrationState } else { 'Unknown' }
+        }
+    }
+    foreach ($ns in $PriorityProviders) {
+        $state = if ($providersByNamespace.ContainsKey($ns)) { $providersByNamespace[$ns] } else { 'NotFound' }
+        $Providers.Add([ordered]@{
+            namespace          = $ns
+            registrationState  = $state
+            subscriptionId     = $sub
+        })
+    }
+}
+
+# --- 4c. Private Endpoint discovery ---
+
+$PrivateEndpoints = [System.Collections.Generic.List[object]]::new()
+foreach ($sub in $Subscription) {
+    $peRaw = Invoke-AzJson -Description "private endpoint listing for subscription $sub" `
+        -Arguments @('network', 'private-endpoint', 'list', '--subscription', $sub, '-o', 'json')
+    foreach ($pe in (ConvertTo-ArrayOrEmpty $peRaw)) {
+        $connections = [System.Collections.Generic.List[object]]::new()
+        $allConnections = @() + @($pe.privateLinkServiceConnections) + @($pe.manualPrivateLinkServiceConnections)
+        foreach ($conn in $allConnections) {
+            if ($null -eq $conn) { continue }
+            $connections.Add([ordered]@{
+                targetResourceId = $conn.privateLinkServiceId
+                status           = $conn.privateLinkServiceConnectionState.status
+            })
+        }
+        $PrivateEndpoints.Add([ordered]@{
+            name           = $pe.name
+            resourceGroup  = $pe.resourceGroup
+            subnet         = $pe.subnet.id
+            subscriptionId = $sub
+            connections    = @($connections)
+        })
+    }
+}
+
+# --- 4d. Private DNS discovery (zones + VNet links) ---
+
+$PrivateDns = [System.Collections.Generic.List[object]]::new()
+foreach ($sub in $Subscription) {
+    $zonesRaw = Invoke-AzJson -Description "private DNS zone listing for subscription $sub" `
+        -Arguments @('network', 'private-dns', 'zone', 'list', '--subscription', $sub, '-o', 'json')
+    foreach ($zone in (ConvertTo-ArrayOrEmpty $zonesRaw)) {
+        $zName = $zone.name
+        $zRg = $zone.resourceGroup
+        $linksRaw = Invoke-AzJson -Description "private DNS VNet link listing for zone $zName (subscription $sub)" `
+            -Arguments @('network', 'private-dns', 'link', 'vnet', 'list', '--resource-group', $zRg, '--zone-name', $zName, '--subscription', $sub, '-o', 'json')
+        $linkedVnets = [System.Collections.Generic.List[string]]::new()
+        foreach ($link in (ConvertTo-ArrayOrEmpty $linksRaw)) {
+            $vnetId = [string]$link.virtualNetwork.id
+            if ($vnetId -and ($vnetId -match '/virtualNetworks/(?<n>[^/]+)$')) {
+                $linkedVnets.Add($Matches['n'])
+            }
+        }
+        $PrivateDns.Add([ordered]@{
+            name           = $zName
+            resourceGroup  = $zRg
+            subscriptionId = $sub
+            linkedVnets    = @($linkedVnets)
+        })
+    }
+}
+
+# --- 4e. Quota/usage discovery ---
+# Regions are derived from already-discovered resource group locations (deduplicated), avoiding
+# any new region-discovery API call. Falls back to a fixed default region when the subscription
+# has no discovered resource groups (e.g. a brand-new, empty subscription).
+
+$QuotaRegions = @($ResourceGroups | ForEach-Object { $_.location } | Where-Object { $_ } | Sort-Object -Unique)
+if ($QuotaRegions.Count -eq 0) {
+    $QuotaRegions = @('eastus')
+    Write-Info "No resource group locations discovered; defaulting quota region to eastus."
+}
+
+$Quotas = [System.Collections.Generic.List[object]]::new()
+foreach ($sub in $Subscription) {
+    foreach ($region in $QuotaRegions) {
+        $vmUsageRaw = Invoke-AzJson -Description "VM usage listing for region $region (subscription $sub)" `
+            -Arguments @('vm', 'list-usage', '--location', $region, '--subscription', $sub, '-o', 'json')
+        foreach ($u in (ConvertTo-ArrayOrEmpty $vmUsageRaw)) {
+            $name = if ($u.localName) { $u.localName } elseif ($u.name.value) { $u.name.value } elseif ($u.name) { $u.name } else { $null }
+            $Quotas.Add([ordered]@{
+                region         = $region
+                category       = 'compute'
+                name           = $name
+                currentValue   = $u.currentValue
+                limit          = $u.limit
+                subscriptionId = $sub
+            })
+        }
+
+        $netUsageRaw = Invoke-AzJson -Description "network usage listing for region $region (subscription $sub)" `
+            -Arguments @('network', 'list-usages', '--location', $region, '--subscription', $sub, '-o', 'json')
+        foreach ($u in (ConvertTo-ArrayOrEmpty $netUsageRaw)) {
+            $name = if ($u.localName) { $u.localName } elseif ($u.name.value) { $u.name.value } elseif ($u.name) { $u.name } else { $null }
+            $Quotas.Add([ordered]@{
+                region         = $region
+                category       = 'network'
+                name           = $name
+                currentValue   = $u.currentValue
+                limit          = $u.limit
+                subscriptionId = $sub
+            })
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 5. Observed naming conventions (best-effort, not authoritative)
 # ---------------------------------------------------------------------------
 
 function Get-NamingSummary {
@@ -577,7 +758,7 @@ $NamingObserved = [ordered]@{
 }
 
 # ---------------------------------------------------------------------------
-# 5. Architecture constraint synthesis (best-effort, cross-section)
+# 6. Architecture constraint synthesis (best-effort, cross-section)
 # ---------------------------------------------------------------------------
 # Runs last: reads from networking, policy, and naming sections already assembled above rather
 # than issuing any new az calls itself.
@@ -647,7 +828,7 @@ $ArchitectureConstraints = [ordered]@{
 }
 
 # ---------------------------------------------------------------------------
-# 6. Assemble output
+# 7. Assemble output
 # ---------------------------------------------------------------------------
 
 $FinalObject = [ordered]@{
@@ -661,9 +842,13 @@ $FinalObject = [ordered]@{
     networking     = [ordered]@{
         vnets = @($Vnets)
     }
-    policy         = $Policy
-    namingObserved = $NamingObserved
-    quotas         = [ordered]@{}
+    policy            = $Policy
+    rbac              = $Rbac
+    providers         = @($Providers)
+    privateEndpoints  = @($PrivateEndpoints)
+    privateDns        = @($PrivateDns)
+    namingObserved    = $NamingObserved
+    quotas            = @($Quotas)
     architectureConstraints = $ArchitectureConstraints
 }
 

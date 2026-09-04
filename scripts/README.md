@@ -77,10 +77,10 @@ are required or used anywhere in either script).
 ## Output
 
 A single JSON document with independent, best-effort top-level sections: `meta`,
-`resourceGroups`, `networking`, `policy`, `namingObserved`, a reserved `quotas` placeholder, and
-`architectureConstraints`. A failure or access denial while gathering one section (e.g. no
-management-group access) is logged as a warning to stderr and does not prevent the other
-sections from populating.
+`resourceGroups`, `networking`, `policy`, `rbac`, `providers`, `privateEndpoints`, `privateDns`,
+`namingObserved`, `quotas`, and `architectureConstraints`. A failure or access denial while
+gathering one section (e.g. no management-group access) is logged as a warning to stderr and
+does not prevent the other sections from populating.
 
 Notable details:
 
@@ -112,10 +112,32 @@ Notable details:
   definition's `policyRule.if` conditions and bucketing each by its `field`. Buckets are
   populated only when the underlying policy actually constrains that dimension; most real-world
   policies only populate `resourceTypesAffected`.
+- `rbac` reports RBAC assignments and custom role definitions: `assignments` (flat list of
+  `{ principalId, principalType, roleDefinitionName, scope, subscriptionId }` from `az role
+  assignment list --all`), `customRoles` (`{ name, id, assignableScopes, subscriptionId }` from
+  `az role definition list`, filtered to custom roles), and `ownershipSummary` — a convenience
+  map of role name → assignment count, not a source of truth (see `assignments` for full detail
+  including scope).
+- `providers` reports the registration state (`Registered`, `NotRegistered`, `Registering`, or
+  `NotFound` if the namespace wasn't returned at all) of a fixed priority list of resource
+  providers relevant to common platform workloads: `Microsoft.CognitiveServices`,
+  `Microsoft.ApiManagement`, `Microsoft.Search`, `Microsoft.ContainerService`,
+  `Microsoft.KeyVault`, `Microsoft.Web`, `Microsoft.Network`, `Microsoft.OperationalInsights`.
+  This is intentionally a curated subset, not the full `az provider list` (which returns 200+
+  providers) — extend the list in both scripts if you need to track additional namespaces.
+- `privateEndpoints` lists every private endpoint (`az network private-endpoint list`) with its
+  `name`, `resourceGroup`, `subnet` (resource ID), `subscriptionId`, and `connections` — the
+  private-link service connection(s)' `targetResourceId` and `status`.
+- `privateDns` lists every private DNS zone (`az network private-dns zone list`) with its
+  `name`, `resourceGroup`, `subscriptionId`, and `linkedVnets` — the names of VNets linked to
+  that zone (`az network private-dns link vnet list`), empty when a zone has no links.
 - `namingObserved` is best-effort pattern mining over existing resource names, explicitly labeled
   "observed" — not an enforced rule unless corroborated by an entry in `policy`.
-- `quotas` is a reserved placeholder for a future iteration (e.g. Cognitive Services / VM usage
-  quotas) — present but empty in this version.
+- `quotas` reports real compute (`az vm list-usage`) and network (`az network list-usages`)
+  quota/usage entries — `{ region, category, name, currentValue, limit, subscriptionId }` where
+  `category` is `compute` or `network`. Regions are derived from the locations of already-
+  discovered resource groups (deduplicated), falling back to `eastus` when the subscription has
+  no discovered resource groups.
 - `architectureConstraints` synthesizes cross-section, best-effort facts computed last (after
   networking, policy, and naming) so an architect doesn't have to manually cross-reference
   sections. It issues no additional `az` calls — it's a pure summarize step over already-
